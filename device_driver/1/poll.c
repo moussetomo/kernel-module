@@ -17,12 +17,14 @@ static char my_devname[]= "poll_dev"; // appears in /proc/devices
 static char rbuf[N+1];  // You can also use kmalloc() memory for your device 
 static int  use_count;
 static int  ir, iw;
-static spinlock_t lock = SPIN_LOCK_UNLOCKED;
+//static spinlock_t lock = SPIN_LOCK_UNLOCKED;
+static DEFINE_SPINLOCK(lock);
 
 #define DEV_MAJOR	249 // for static  major and minor device node 
 #define DEV_MINOR	5
 
 static DECLARE_WAIT_QUEUE_HEAD(qin); // Wait queue head for read event 
+static DECLARE_WAIT_QUEUE_HEAD(qout); // Wait queue head for write event 
 static struct semaphore sema;
 
 static int is_buffer_empty(void)
@@ -33,12 +35,23 @@ static int is_buffer_empty(void)
      return 0;
 }
 
+static int is_buffer_full(void) {
+	int ih = ir - 1;
+	if(ih < 0)
+		ih += N;
+	if(iw == ih) {
+		return 1;
+	}
+	return 0;
+}
+
 static unsigned int device_poll(struct file *filp, poll_table *wait)
 {
         unsigned int mask=0;
 
         poll_wait(filp, &qin, wait);
-
+		poll_wait(filp, &qout, wait);
+		
         /* Serialize access */
         spin_lock(&lock);
 
@@ -47,6 +60,12 @@ static unsigned int device_poll(struct file *filp, poll_table *wait)
           printk ("%s - POLLIN EVENT:ir=%d|iw=%d\n", my_devname,ir,iw);
                mask |= POLLIN | POLLRDNORM;  /* fd is readable */
         }
+
+		if(!is_buffer_full())
+		{
+		  printk( "%s - POLLOUT EVENT:ir=%d|iw=%d\n", my_devname, ir, iw);
+		  mask |= POLLOUT | POLLRDNORM;
+		}
 
 	spin_unlock(&lock);
 
@@ -97,7 +116,8 @@ static ssize_t device_read(struct file *filp,
 
    up(&sema);
 
-// add code to wake up writers. Writers are not blocked in this version 
+  // wake up write since device has at least one byte of room
+  if(i > 0) wake_up_interruptible(&qout);
 
   return i;
 }
@@ -105,11 +125,33 @@ static ssize_t device_read(struct file *filp,
 static ssize_t device_write(struct file *filp, 
                             const char *buffer, size_t len, loff_t *offs)
 {
-
- //add code to put a process to sleep if no room to write 
+  DECLARE_WAITQUEUE(wait, current); /* contains a pointer to a task struct */
 
   unsigned int i=0;
   int ih;
+
+  if(is_buffer_full()) { /* no room to write */
+    if(filp->f_flags & O_NONBLOCK) {
+	  return -EAGAIN;
+	}
+  }
+
+  add_wait_queue(&qout, &wait);
+  while(is_buffer_full()) {
+	printk("%s write - blocking \r\n", my_devname);
+	set_current_state(TASK_INTERRUPTIBLE);
+	if(!is_buffer_full())
+	  break;
+	schedule();
+	if(signal_pending(current)) {
+	  set_current_state(TASK_RUNNING);
+	  remove_wait_queue(&qout, &wait);
+	  return -ERESTARTSYS;
+	} /* signal */
+  } /* while */
+
+  set_current_state(TASK_RUNNING);
+  remove_wait_queue(&qout, &wait);
 
    if (down_interruptible(&sema))  // serialize access to device 
       return -ERESTARTSYS;
@@ -124,7 +166,7 @@ static ssize_t device_write(struct file *filp,
     if(iw==N) iw=0;
   }
 
-  printk(" %s write - %d bytes \r\n", my_devname, i);
+  printk(" %s write - %d bytes %d %d \r\n", my_devname, i, iw, ir);
 
   up(&sema);
 
