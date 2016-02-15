@@ -12,6 +12,7 @@
 #include <linux/device.h>  // dynamic device node creation     
 
 static char my_devname[]= "poll_dev"; // appears in /proc/devices
+static struct class *dev_class;
 
 #define  N 23
 static char rbuf[N+1];  // You can also use kmalloc() memory for your device 
@@ -76,31 +77,12 @@ static unsigned int device_poll(struct file *filp, poll_table *wait)
 static ssize_t device_read(struct file *filp, 
                            char *buffer, size_t len, loff_t *offs)
 {
-  DECLARE_WAITQUEUE(wait, current); /* contains a pointer to a task struct */
   unsigned int i=0;
 
-     if (is_buffer_empty()) /* no data to read */
-	if (filp->f_flags & O_NONBLOCK) 
-	 return -EAGAIN;
-
-     add_wait_queue(&qin, &wait); /* Link our wait struct to the qin waitq */
-
-     while(is_buffer_empty()){
-        printk(" %s read - blocking \r\n", my_devname);
-        set_current_state(TASK_INTERRUPTIBLE);
-       if(!is_buffer_empty()) /* There is a data in device */
-          break;  
-       schedule();
-       if(signal_pending(current)) {
-         set_current_state(TASK_RUNNING);
-         remove_wait_queue(&qin,&wait);
-         return -ERESTARTSYS;
-       } /* singal */
-     } /* while */
-
-  set_current_state(TASK_RUNNING);
-  remove_wait_queue(&qin,&wait);
-
+  wait_event_interruptible(qin, !is_buffer_empty());
+  if(signal_pending(current)) {
+	return -ERESTARTSYS;
+  }
   if (down_interruptible(&sema))
         return -ERESTARTSYS;
 
@@ -125,36 +107,15 @@ static ssize_t device_read(struct file *filp,
 static ssize_t device_write(struct file *filp, 
                             const char *buffer, size_t len, loff_t *offs)
 {
-  DECLARE_WAITQUEUE(wait, current); /* contains a pointer to a task struct */
-
   unsigned int i=0;
   int ih;
 
-  if(is_buffer_full()) { /* no room to write */
-    if(filp->f_flags & O_NONBLOCK) {
-	  return -EAGAIN;
-	}
+  wait_event_interruptible(qout, !is_buffer_full());
+  if(signal_pending(current)) {
+	return -ERESTARTSYS;
   }
-
-  add_wait_queue(&qout, &wait);
-  while(is_buffer_full()) {
-	printk("%s write - blocking \r\n", my_devname);
-	set_current_state(TASK_INTERRUPTIBLE);
-	if(!is_buffer_full())
-	  break;
-	schedule();
-	if(signal_pending(current)) {
-	  set_current_state(TASK_RUNNING);
-	  remove_wait_queue(&qout, &wait);
-	  return -ERESTARTSYS;
-	} /* signal */
-  } /* while */
-
-  set_current_state(TASK_RUNNING);
-  remove_wait_queue(&qout, &wait);
-
-   if (down_interruptible(&sema))  // serialize access to device 
-      return -ERESTARTSYS;
+  if (down_interruptible(&sema))  // serialize access to device 
+    return -ERESTARTSYS;
 
   ih=ir-1; 
   if(ih<0) ih+=N;
@@ -249,6 +210,9 @@ static int __init my_init(void)
 
   major = MAJOR(dev); /* device major number */
 
+  dev_class = class_create(THIS_MODULE, "poll");
+  if(IS_ERR(dev_class)) return PTR_ERR(dev_class);
+
  /* allocate cdev structure and point to our device fops*/
   my_cdev = cdev_alloc();
   cdev_init(my_cdev, &fops);
@@ -263,6 +227,8 @@ static int __init my_init(void)
 
   use_count = 0;  /* initialize use count */
 
+  device_create(dev_class, NULL, dev, NULL, my_devname);
+
   printk(" %s init - major: %d  \r\n", my_devname, major);
 
   return res;
@@ -271,6 +237,8 @@ static int __init my_init(void)
 static void __exit my_exit(void)
 {
   cdev_del(my_cdev);
+  device_destroy(dev_class, dev);
+  class_destroy(dev_class);
   unregister_chrdev_region(dev, 1);
 
  // For static device nodes, use unregister_chrdev(wait_major,my_devname);
