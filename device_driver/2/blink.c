@@ -54,7 +54,7 @@ static void my_timer_func(unsigned long ptr)
 	  *                         unsigned int cmd, unsigned long arg)
 	  */
 
-	(my_driver->ops->ioctl) (vc_cons[fg_console].d->vc_tty, NULL, KDSETLED,
+	(my_driver->ops->ioctl) (vc_cons[fg_console].d->port.tty, KDSETLED,
 			    *pstatus);
 
 	my_timer.expires = jiffies + BLINK_DELAY;
@@ -72,11 +72,11 @@ static int __init kbleds_init(void)
 			break;
 		printk(KERN_INFO "poet_atkm: console[%i/%i] #%i, tty %lx\n", i,
 		       MAX_NR_CONSOLES, vc_cons[i].d->vc_num,
-		       (unsigned long)vc_cons[i].d->vc_tty);
+		       (unsigned long)vc_cons[i].d->port.tty);
 	}
 	printk(KERN_INFO "kbleds: finished scanning consoles\n");
 
-	my_driver = vc_cons[fg_console].d->vc_tty->driver;
+	my_driver = vc_cons[fg_console].d->port.tty->driver;
 	printk(KERN_INFO "kbleds: tty driver magic %x\n", my_driver->magic);
 
 	/*
@@ -95,7 +95,7 @@ static void __exit kbleds_cleanup(void)
 {
 	printk(KERN_INFO "kbleds: unloading...\n");
 	del_timer(&my_timer);
-	(my_driver->ops->ioctl) (vc_cons[fg_console].d->vc_tty, NULL, KDSETLED,
+	(my_driver->ops->ioctl) (vc_cons[fg_console].d->port.tty, KDSETLED,
 			    RESTORE_LEDS);
 }
 
