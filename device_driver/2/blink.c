@@ -3,6 +3,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/tty.h>		/* For fg_console, MAX_NR_CONSOLES */
 #include <linux/kd.h>		/* For KDSETLED */
@@ -10,16 +11,25 @@
 #include <linux/device.h>
 #include <linux/cdev.h>
 #include <linux/fs.h>
+#include <linux/workqueue.h>
 
 MODULE_DESCRIPTION("Example module illustrating the use of Keyboard LEDs.");
-MODULE_AUTHOR("Daniele Paolo Scarpazza");
+MODULE_AUTHOR("Masatomo Takai");
 MODULE_LICENSE("GPL");
 
+static struct workqueue_struct *my_wq;
+
+typedef struct {
+		struct delayed_work my_work;
+		int delay;
+} my_work_t;
+
+my_work_t *work;
 struct timer_list my_timer;
 struct tty_driver *my_driver;
 char kbledstatus = 0;
 
-#define BLINK_DELAY   HZ/5
+#define BLINK_DELAY   HZ
 #define ALL_LEDS_ON   0x07
 #define RESTORE_LEDS  0xFF
 
@@ -38,7 +48,7 @@ char kbledstatus = 0;
  * 
  */
 
-static void my_timer_func(unsigned long ptr)
+/*static void my_timer_func(unsigned long ptr)
 {
 	int *pstatus = (int *)ptr;
 
@@ -46,24 +56,31 @@ static void my_timer_func(unsigned long ptr)
 		*pstatus = RESTORE_LEDS;
 	else
 		*pstatus = ALL_LEDS_ON;
-
+*/
 	/** vc_cons is a struct type vc that contains a pointer to a 
 	  * virtual console (d) of type vc_data	vc_tty is the tty port where 
 	  * console is attached, fg_console is the current console 
 	  * vt_ioctl(struct tty_struct *tty, struct file *file, 	
 	  *                         unsigned int cmd, unsigned long arg)
 	  */
-
+/*
 	(my_driver->ops->ioctl) (vc_cons[fg_console].d->port.tty, KDSETLED,
 			    *pstatus);
 
 	my_timer.expires = jiffies + BLINK_DELAY;
 	add_timer(&my_timer);
 }
+*/
+static void my_wq_function(struct delayed_work *work) {
+	my_work_t *my_work = (my_work_t *)work;
+	printk("my work.delay %d\n", my_work->delay);
+	queue_delayed_work(my_wq, work, my_work->delay);
+	return;
+}
 
 static int __init kbleds_init(void)
 {
-	int i;
+	int i, ret;
 
 	printk(KERN_INFO "kbleds: loading\n");
 	printk(KERN_INFO "kbleds: fgconsole is %x\n", fg_console);
@@ -82,21 +99,42 @@ static int __init kbleds_init(void)
 	/*
 	 * Set up the LED blink timer the first time
 	 */
-	init_timer(&my_timer);
+	/*init_timer(&my_timer);
 	my_timer.function = my_timer_func;
 	my_timer.data = (unsigned long)&kbledstatus;
 	my_timer.expires = jiffies + BLINK_DELAY;
 	add_timer(&my_timer);
+	*/
 
+	my_wq = create_workqueue("my_queue");
+	if(my_wq) {
+		/* Queue some work */
+		work = (my_work_t *)kmalloc(sizeof(my_work_t), GFP_KERNEL);
+		if(work) {
+			INIT_DELAYED_WORK((struct delayed_work*)work, my_wq_function);
+			work->delay = BLINK_DELAY;
+			ret = queue_delayed_work(my_wq, (struct delayed_work *)work, BLINK_DELAY);
+		}
+	}
 	return 0;
 }
 
 static void __exit kbleds_cleanup(void)
 {
 	printk(KERN_INFO "kbleds: unloading...\n");
-	del_timer(&my_timer);
+	/*del_timer(&my_timer);
 	(my_driver->ops->ioctl) (vc_cons[fg_console].d->port.tty, KDSETLED,
 			    RESTORE_LEDS);
+	*/
+	if(delayed_work_pending(&(work->my_work))) {
+		cancel_delayed_work_sync(&(work->my_work));
+		printk(KERN_ALERT "Cancelling delayed work...\n");
+	}
+	printk("flushing\n");
+	flush_workqueue(my_wq);
+	printk("freeing\n");
+	kfree(work);
+	destroy_workqueue(my_wq);
 }
 
 module_init(kbleds_init);
