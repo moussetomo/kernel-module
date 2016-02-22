@@ -24,6 +24,7 @@ typedef struct {
 	struct delayed_work my_work;
 	int delay;
 	int led;
+	int led_status;
 } my_work_t;
 my_work_t *work;
 
@@ -42,6 +43,7 @@ Don't need it if you want major number assigned to your module dynamically
 #define HELLOPLUS "helloplus"
 */
 
+#define ALL_LEDS_OFF 0x00
 #define ALL_LEDS_ON 0x07
 #define CAP_LED_ON ALL_LEDS_ON & 0x01
 #define SCROLL_LED_ON ALL_LEDS_ON & 0x02
@@ -78,6 +80,14 @@ static void my_wq_function(struct delayed_work *work) {
 		default:
 			led = ALL_LEDS_ON;
 	}
+
+	if(my_work->led_status == 0) {
+		led = ALL_LEDS_OFF;
+		my_work->led_status = 1;
+	} else {
+		my_work->led_status = 0;
+	}
+
 	(my_driver->ops->ioctl) (vc_cons[fg_console].d->port.tty, KDSETLED, led);
 	queue_delayed_work(my_wq, work, my_work->delay);
 	return;
@@ -226,6 +236,7 @@ static int __init helloplus_init(void)
 			INIT_DELAYED_WORK((struct delayed_work *)work, my_wq_function);
 			work->delay = secs2hello;
 			work->led = led2hello;
+			work->led_status = 1;
 			ret = queue_delayed_work(my_wq, (struct delayed_work *)work, secs2hello);
 		}
 	}
@@ -255,6 +266,7 @@ static void __exit helloplus_cleanup(void)
 
 	unregister_chrdev_region(dev,1);
 
+	(my_driver->ops->ioctl) (vc_cons[fg_console].d->port.tty, KDSETLED, ALL_LEDS_OFF);
 	printk("In cleanup module\n");
 }
 
