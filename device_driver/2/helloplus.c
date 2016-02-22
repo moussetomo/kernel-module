@@ -45,9 +45,9 @@ Don't need it if you want major number assigned to your module dynamically
 
 #define ALL_LEDS_OFF 0x00
 #define ALL_LEDS_ON 0x07
-#define CAP_LED_ON ALL_LEDS_ON & 0x01
-#define SCROLL_LED_ON ALL_LEDS_ON & 0x02
-#define NUM_LED_ON ALL_LEDS_ON & 0x04
+#define CAP_LED_ON 0x01
+#define SCROLL_LED_ON 0x02
+#define NUM_LED_ON 0x04
 #define INITIAL_SECS 	HZ
 static unsigned long secs2hello = INITIAL_SECS;
 static unsigned long led2hello = ALL_LEDS_ON;
