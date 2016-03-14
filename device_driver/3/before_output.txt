@@ -1,2 +1,0 @@
-/dev/kmalloc_dev has 0123456789
-/dev/vmalloc_dev has abcdefghijklmnopqrstuvwxyz

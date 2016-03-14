@@ -1,8 +1,0 @@
-kmalloc mptr is 0x7f25cf488000
-kmalloc mmap:  '0123456789'
-kmalloc mptr is 0x7f25cf488000
-vmalloc mptr is 0x7f25cf487000
-vmalloc mmap:  'abcdefghijklmnopqrstuvwxyz'
-vmalloc mptr is 0x7f25cf487000
-kmalloc mmap:  'MY KMALLOC STRING!'
-vmalloc mmap:  'MY VMALLOC STRING!'
