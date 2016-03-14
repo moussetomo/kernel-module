@@ -1,0 +1,2 @@
+/dev/kmalloc_dev has MY KMALLOC STRING!
+/dev/vmalloc_dev has MY VMALLOC STRING!
