@@ -25,6 +25,9 @@
 #include <linux/usb.h>
 #include <asm/uaccess.h>
 
+#define VENDOR_ID_REALTEK		0x0bda
+#define PRODUCT_ID_RTL8150		0x8150
+
 #define DRV_NAME "LDDA_USB"  // Use it to change name of interface from eth
 
 // rtl8150 Datasheet - Page 9, Vendor Specific Memory Read/Write Commands
@@ -43,8 +46,8 @@
 
 // Table of devices that work with this driver 
 static struct usb_device_id rtl8150_table[] = {
-	{"Realtek RTL8150 USB 10/100 Fast Ethernet Adatper", 0x0bda, 0x8150, 0x00},
-	{0, }
+	{USB_DEVICE(VENDOR_ID_REALTEK, PRODUCT_ID_RTL8150)},
+	{}
 };
 
 /** 
@@ -82,26 +85,24 @@ static struct usb_driver rtl8150_driver = {
 	.disconnect =	rtl8150_disconnect
 };
 
-#ifdef HAVE_NET_DEVICE_OPS
 static struct net_device_ops rtl8150_netdev_ops = {
         .ndo_open               = rtl8150_open,
         .ndo_stop               = rtl8150_close,
         .ndo_get_stats          = rtl8150_get_stats,
         .ndo_start_xmit         = rtl8150_start_xmit
 };
-#endif
 
 /********* USB ROUTINES*************/
 
 static int rtl8150_probe(struct usb_interface *intf,
                          const struct usb_device_id *id)
 {
-        struct net_device *dev;
+        struct net_device *netdev;
         struct rtl8150 *priv;
+		struct usb_device *udev;
 
 	/* extract usb_device from the usb_interface structure */
-
-	/* CODE HERE */
+	udev = interface_to_usbdev(intf);
 
 	/**
           * Linux Network Stack works with network device not the USB device. 
@@ -109,38 +110,33 @@ static int rtl8150_probe(struct usb_interface *intf,
           * allocates net device structure with memory allocated for 
           * rtl8150 private structure. Return ENOMEM if failed
 	  */
-	
-	/* CODE HERE */
+	netdev = alloc_etherdev(sizeof(*priv));
+	if(!netdev) return -ENOMEM;
 
 	/** 
-         * Set the device name to DRV_NAME instead of eth via memcpy 
-	 *
-         * What routine provides access to device's private structure from the 
-         * net_device instance 
-         */
+    * Set the device name to DRV_NAME instead of eth via memcpy 
+	*
+    * What routine provides access to device's private structure from the 
+    * net_device instance 
+    */
+	priv = netdev_priv(netdev);
+	memcpy(netdev->name, DRV_NAME, sizeof(DRV_NAME));
 
-	/* CODE HERE */
+    /* sysfs stuff. Sets up device link in /sys/class/net/interface_name */
+    SET_NETDEV_DEV(netdev, &intf->dev);
 
-        /* sysfs stuff. Sets up device link in /sys/class/net/interface_name */
-        SET_NETDEV_DEV(dev, &intf->dev);
-
-#ifdef HAVE_NET_DEVICE_OPS
-        dev->netdev_ops = &rtl8150_netdev_ops;
-#else
-        dev->open = rtl8150_open;
-        dev->stop = rtl8150_close;
-        dev->hard_start_xmit = rtl8150_start_xmit;
-        dev->get_stats = rtl8150_get_stats;
-#endif
+    netdev->netdev_ops = &rtl8150_netdev_ops;
 
 	/* Initialize Device private structure and initialize the spinlock*/
-
-	/* CODE HERE */
+	spin_lock_init(&priv->lock);
+	priv->udev = udev;
+	priv->netdev = netdev;
 
 
 	/* Register netdevice. If fail goto out  */
-	
-	/* CODE HERE */
+	if(register_netdev(netdev) != 0) {
+		goto out;
+	}
 
         /**
           * You can stuff device private structure into USB Interface 
@@ -148,8 +144,7 @@ static int rtl8150_probe(struct usb_interface *intf,
 	  * using usb__get_drvdata, for example, in disconnect or other driver 
 	  * functions
           */
-
-	/* CODE HERE */
+	usb_set_intfdata(intf, priv);
 
 	/**
           * Update net device struct with MAC and Broadcast address
@@ -222,21 +217,29 @@ static int rtl8150_probe(struct usb_interface *intf,
 	  * Read six bytes into net_device structure member dev_addr from 
 	  * device memory location IDR 
 	  */ 
-
-	  /* CODE HERE */
+		usb_control_msg(priv->udev,
+						usb_rcvctrlpipe(priv->udev, 0),
+						RTL8150_REQ_GET_REGS,
+						RTL8150_REQT_READ,
+						IDR,
+						0,
+						priv->netdev->dev_addr,
+						sizeof(priv->netdev->dev_addr),
+						500
+					   );
 
         /* Length of Ethernet frame. It is a "hardware header length", number 
          * of octets that lead the transmitted packet before IP header, or 
          * other protocol information.  Value is 14 for Ethernet interfaces.
          */
 
-        dev->hard_header_len = 14;
+        netdev->hard_header_len = 14;
 
 	return 0;
 
 out:
         usb_set_intfdata(intf, NULL);
-        free_netdev(dev);
+        free_netdev(netdev);
         return -EIO;
 }
 
@@ -267,51 +270,47 @@ static int rtl8150_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
 static struct net_device_stats* rtl8150_get_stats(struct net_device *dev)
 {
-        struct rtl8150 *priv = netdev_priv( dev );
+	struct rtl8150 *priv = netdev_priv( dev );
 
-        printk("dev_get_stats: Add code later\n");
+	printk("dev_get_stats: Add code later\n");
 
-        /**
-         * You cannot return NULL, make sure to return the address 
-         * of net_dev_stat that is in device private structure
-         */
-
-        /* CODE HERE */
+	/**
+	* You cannot return NULL, make sure to return the address 
+	* of net_dev_stat that is in device private structure
+	*/
+	return &(priv->stats);
 }
 
 /* USB disconnect routine - required else can't rmmod */
 static void rtl8150_disconnect(struct usb_interface *intf)
 {
 	/* Get address of device private structure */
-
-	/* CODE HERE */
+	struct rtl8150 *priv = usb_get_intfdata(intf);
 
 	if (priv) {
-	
-	/**
-	  * Unregister and free memory of net_device structure
-	  * Call usb_set_intfdata(intf, NULL) to free memory	
-	  */
-
-	  /* CODE HERE */
-
+		/**
+	  	* Unregister and free memory of net_device structure
+	  	* Call usb_set_intfdata(intf, NULL) to free memory	
+	  	*/
+		unregister_netdev(priv->netdev);
+		usb_set_intfdata(intf, NULL);
 	}
 }
 
 /************* USB init and exit routines ***************/
 static int __init usb_rtl8150_init(void)
 {
-	/* CODE HERE */
+	return usb_register(&rtl8150_driver);
 }
 
 static void __exit usb_rtl8150_exit(void)
 {
-	/* CODE HERE */
+	usb_deregister(&rtl8150_driver);
 }
 
 module_init(usb_rtl8150_init);
 module_exit(usb_rtl8150_exit);
 
-MODULE_AUTHOR(" ");
+MODULE_AUTHOR("Masatomo Takai");
 MODULE_DESCRIPTION("USB Driver for Realtek rtl8150 USB Ethernet Wired Card");
 MODULE_LICENSE("Dual BSD/GPL");
