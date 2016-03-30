@@ -25,24 +25,12 @@
 #include <linux/usb.h>
 #include <asm/uaccess.h>
 
+#include "rtl8150.h"
+
 #define VENDOR_ID_REALTEK		0x0bda
 #define PRODUCT_ID_RTL8150		0x8150
 
 #define DRV_NAME "LDDA_USB"  // Use it to change name of interface from eth
-
-// rtl8150 Datasheet - Page 9, Vendor Specific Memory Read/Write Commands
-
-#define RTL8150_REQT_READ       0xc0
-#define RTL8150_REQT_WRITE      0x40
-
-#define RTL8150_REQ_GET_REGS    0x05
-#define RTL8150_REQ_SET_REGS    0x05
-
-// Register offset in device memory  - rtl8150 Datasheet page 17 
-
-#define	IDR	0x0120  	//  Device memory where MAC address is found
-
-
 
 // Table of devices that work with this driver 
 static struct usb_device_id rtl8150_table[] = {
@@ -57,26 +45,6 @@ static struct usb_device_id rtl8150_table[] = {
   */
 
 MODULE_DEVICE_TABLE(usb, rtl8150_table);
-
-/* Device private structure */
-
-struct rtl8150 {
-	struct usb_device *udev; 	// USB device
-	struct net_device *netdev;	// Net device
-	struct net_device_stats stats;  // Net device stats
-	spinlock_t lock;
-
-	// Add rtl8150 device specific stuff later 
-};
-
-static int rtl8150_probe(struct usb_interface *intf,
-			   const struct usb_device_id *id);
-static void rtl8150_disconnect(struct usb_interface *intf);
-static int rtl8150_open(struct net_device *dev);
-static int rtl8150_close(struct net_device *dev);
-static int rtl8150_start_xmit(struct sk_buff *skb, struct net_device *dev);
-static struct net_device_stats* rtl8150_get_stats(struct net_device *dev);
-
 
 static struct usb_driver rtl8150_driver = {
 	.name =		DRV_NAME,
@@ -98,7 +66,7 @@ static int rtl8150_probe(struct usb_interface *intf,
                          const struct usb_device_id *id)
 {
         struct net_device *netdev;
-        struct rtl8150 *priv;
+        rtl8150_t *priv;
 		struct usb_device *udev;
 
 	/* extract usb_device from the usb_interface structure */
@@ -243,34 +211,331 @@ out:
         return -EIO;
 }
 
-static int rtl8150_open(struct net_device *dev)
+static void read_bulk_callback(struct urb *urb)
 {
-	printk("rtl8150_open: Add code later\n");
-        netif_start_queue(dev); /* transmission queue start */
-        return 0;
+	rtl8150_t *priv;
+	struct net_device *netdev;
+	int res, pkt_len;
+	// Get access to priv struct and status of urb
+	int status = urb->status;
+	priv = urb->context;
+	if(!priv) return;
+	netdev = priv->netdev;
 
+	switch(status) {
+		case 0:  break;
+		case -ENOENT: return; /* urb is unlinked */
+		case -ETIME:
+			printk("\n Reschedule it. Could be a problem with device\n");
+			goto reschedule;
+		default:
+			printk("\nRx status %d\n", status);
+			goto reschedule;
+	}
+
+	// we come here after receiving success status of urb
+	res = urb->actual_length; // amount of actual data received in the urb. Size of the packet
+	pkt_len = res - 4;	// first 4 bytes contains Rx header and CRC..
+
+	/**
+	 * 1- Use skb_put to set skb->len and skb->tail to actual payload
+	 * 2- Set protocol field in skb
+	 * 3- Hand over the packet to protocol layer
+	 * 4- Increment rx_packet and rx_bytes
+	 */
+	skb_put(priv->rx_skb, pkt_len); // update skb->len and skb->tail to point to actual payload
+
+	priv->rx_skb->protocol = eth_type_trans(priv->rx_skb, netdev);
+	netif_rx(priv->rx_skb); // hand over the sk_buff to the protocol layer
+							// make sure don't touch the skb or free it
+	priv->stats.rx_packets++;
+	priv->stats.rx_bytes += pkt_len;
+
+	reschedule:	// submit another urb for next packet receive from the device
+
+	/**
+	 * Allocate sk_buff again and point priv->rx_skb to it
+	 * populate bulk URB, Don't need to allocate urb, reuse it.
+	 * submit urb.
+	 * CAUTION: code is running in atomic or /interrupt context
+	 */
+	priv->rx_skb = dev_alloc_skb(RTL8150_MTU + 2);
+	skb_reserve(priv->rx_skb, 2);
+	usb_fill_bulk_urb(priv->rx_urb, priv->udev, usb_rcvbulkpipe(priv->udev, 1), priv->rx_skb->data, RTL8150_MTU, read_bulk_callback, priv);
+	res = usb_submit_urb(priv->rx_urb, GFP_ATOMIC);
+	return;
+}
+
+static void write_bulk_callback(struct urb *urb)
+{
+	rtl8150_t *priv;
+	int status, res, pkt_len;
+
+	printk(KERN_INFO "Entering %s\n", __FUNCTION__);
+	// Get access to priv struct and status of urb
+	priv = urb->context;
+	if(!priv) return;
+
+	status = urb->status;
+
+	switch(status) {
+		case 0: break;
+		case -ENOENT: return; /* urb is in unlink state */
+		case -ETIME:
+			printk("\n Could be a problem with device\n");
+			goto reenable;
+		default:
+			printk("\n%s: Tx status %d\n", priv->netdev->name, status);
+			goto reenable;
+	}
+
+	res = urb->actual_length; // amount of actual data received in the urb. Size of the packet
+	pkt_len = res - 4;	// first 4 bytes contains Rx header and CRC..
+
+	// urb was transmitted successfully
+	// increment tx_packets and tx_bytes
+	priv->stats.tx_packets++;
+	priv->stats.tx_bytes += pkt_len;
+
+	printk(KERN_INFO "\n%s: Queued Tx packet at %p size %u\n", priv->netdev->name, priv->tx_skb->data, priv->tx_skb->len);
+	dev_kfree_skb_irq(priv->tx_skb); // free skb, atomic context
+
+	/**
+	 * Protocol layer should take case of error recovery.
+	 * We should just enable the queue so that protocol layer
+	 * continue to send skb_buff to us.
+	 */
+	reenable: // enable the queue
+
+	netif_wake_queue(priv->netdev);
+	return;
+}
+
+static void intr_callback(struct urb *urb)
+{
+	rtl8150_t *priv;
+	int status;
+	int res;
+	__u8 *d;	// used for pointing to transfer_buffer
+
+	// Get access to priv struct and status of urb
+	priv = urb->context;
+	if(!priv) return;
+	status = urb->status;
+	switch(status) {
+		case 0: break;
+		case -ECONNRESET: // urb is unlinked
+		case -ENOENT:
+		case -ESHUTDOWN:
+			return;
+		default:
+			dev_info(&urb->dev->dev, "%s intr status %d\n", priv->netdev->name, status);
+			goto resubmit;
+	}
+
+	// we get here when status is set to success
+	d = urb->transfer_buffer;
+	// Test for transmit errors
+	if(d[0] & TSR_ERRORS) {
+		priv->netdev->stats.tx_errors++;
+		if(d[INT_TSR] & (TSR_ECOL | TSR_JBR))
+			priv->netdev->stats.tx_aborted_errors++;
+		if(d[INT_TSR] & TSR_LCOL)
+			priv->netdev->stats.tx_window_errors++;
+		if(d[INT_TSR] & TSR_LOSS_CRS)
+			priv->netdev->stats.tx_carrier_errors++;
+	}
+
+	/* report link status changes to the network stack */
+	if((d[INT_MSR] & MSR_LINK) == 0) {
+		if(netif_carrier_ok(priv->netdev)) {
+			netif_carrier_off(priv->netdev);
+			printk("%s: LINK LOST\n", __FUNCTION__);
+		}
+	} else {
+		if(!netif_carrier_ok(priv->netdev)) {
+			netif_carrier_on(priv->netdev);
+			printk("%s: LINK CAME BACK\n", __FUNCTION__);
+		}
+	}
+
+	resubmit:
+		res = usb_submit_urb(urb, GFP_ATOMIC);
+
+		return;
+}
+
+static int rtl8150_open(struct net_device *netdev)
+{
+	rtl8150_t *priv;
+	int res;
+
+	printk(KERN_INFO "Entering %s\n", __FUNCTION__);
+	/* Get the address of private structure from net_device */
+	priv = netdev_priv(netdev);
+
+	// set registers
+	usb_control_msg(priv->udev, usb_sndctrlpipe(priv->udev, 0),
+					RTL8150_REQ_SET_REGS, RTL8150_REQT_WRITE, IDR, 0,
+					netdev->dev_addr, sizeof(netdev->dev_addr), 500);
+	
+	/* 
+	 * Driver sets up pipes to bulk IN (EP1) endpoint for
+	 * receiving packets, bulk OUT (EP2) for transmitting packets
+	 * and to interrupt IN (EP3) endpoint for receiving device errors
+	 * and link status from the device:
+	 *
+	 * 1- Allocate memory for bulk IN, OUT, and interrupt urb
+	 * 2- Allocate memory for sk_buff for bulk IN urb -receive
+	 * 3- Populate bulk IN urb and register call back function
+	 * NOTE Make sure to allocate memory for intr_buff
+	 * 4- Populate interrupt urb and register call back funciton
+	 * 5- Submit bulk IN and interrupt urb
+	 *
+	 * NOTE: Driver submits urb to bulk OUT EP from rtl8150_start_xmit
+	 * when the driver receives sk_buff from the protocol layer
+	 */
+	priv->rx_urb = usb_alloc_urb(0, GFP_KERNEL);
+	priv->intr_urb = usb_alloc_urb(0, GFP_KERNEL);
+
+	priv->rx_skb = dev_alloc_skb(RTL8150_MTU + 2);
+	skb_reserve(priv->rx_skb, 2);
+
+	usb_fill_bulk_urb(priv->rx_urb, priv->udev, usb_rcvbulkpipe(priv->udev, 1),
+					priv->rx_skb->data, RTL8150_MTU, read_bulk_callback, priv);
+	if((res = usb_submit_urb(priv->rx_urb, GFP_KERNEL))) {
+		if(res == -ENODEV)
+			netif_device_detach(priv->netdev);
+		return res;
+	}
+	
+	priv->intr_buff = kmalloc(INTBUFSIZE, GFP_KERNEL);
+	priv->intr_interval = 100;
+	usb_fill_int_urb(priv->intr_urb, priv->udev, usb_rcvintpipe(priv->udev, 3),
+					priv->intr_buff, INTBUFSIZE, intr_callback,
+					priv, priv->intr_interval);
+	if((res = usb_submit_urb(priv->intr_urb, GFP_KERNEL))) {
+		if(res == -ENODEV)
+			netif_device_detach(priv->netdev);
+			usb_kill_urb(priv->rx_urb);
+	}
+
+	printk(KERN_INFO "\n Submit Rx and Intr urbs\n");
+
+	// Initialize the hardware to make sure it is ready
+	rtl8150_hardware_start(netdev);
+
+	/* Nofify the protocol layer so that it can start sending packet */
+	netif_start_queue(netdev); /* transmission queue start */
+
+	printk(KERN_INFO "Exiting %s\n", __FUNCTION__);
+    return 0;
 }
 
 static int rtl8150_close(struct net_device *dev)
 {
-        printk("rtl8150_close: Add code later \n");
+		u8 cr;
+		rtl8150_t *priv;
+        printk("rtl8150_close\n");
+		// get address of private structure and ioaddr
+		priv = netdev_priv(dev);
+		// Notify protocol layer not to send any more packet to this interface
         netif_stop_queue(dev); /* transmission queue stop */
+		printk(KERN_INFO "\n rtl8150 close: shutting down the interface");
+
+		// get the value of CR register into cr using usb_control_msg
+		usb_control_msg(priv->udev, usb_sndctrlpipe(priv->udev, 0), RTL8150_REQ_GET_REGS, RTL8150_REQT_READ, CR, 0, &cr, sizeof(cr), 500);
+		cr &= 0xf3;
+
+		// set the CR register to what is in cr using usb_control_msg
+		usb_control_msg(priv->udev, usb_sndctrlpipe(priv->udev, 0), RTL8150_REQ_SET_REGS, RTL8150_REQT_WRITE, CR, 0, &cr, sizeof(cr), 500);
+
+		// unlink all urbs
+		usb_kill_urb(priv->rx_urb);
+		usb_kill_urb(priv->tx_urb);
+		usb_kill_urb(priv->intr_urb);
         return 0;
 
 }
 
+static void rtl8150_hardware_start(struct net_device *netdev)
+{
+	u8 data = 0x10;
+	u8 cr = 0x0c;
+	u8 tcr = 0xd8;
+	u8 rcr = 0x9e;
+	short tmp;
+	int i = HZ;
+	rtl8150_t *priv;
+
+	// get address of device private staructure
+	priv = netdev_priv(netdev);
+
+	printk("Entering %s \n", __FUNCTION__);
+	
+	// reset the chip. Make sure to wait for chip to reset
+	usb_control_msg(priv->udev, usb_sndctrlpipe(priv->udev, 0), RTL8150_REQ_SET_REGS, RTL8150_REQT_WRITE, CR, 0, &data, 1, 500);
+
+	// confirm it that device has been reset successfully
+	do {
+		usb_control_msg(priv->udev, usb_sndctrlpipe(priv->udev, 0), RTL8150_REQ_SET_REGS, RTL8150_REQT_WRITE, CR, 0, &data, 1, 500);
+	} while((data & 0x10) && --i);
+
+	printk(KERN_INFO "\n DEVICE IS RESET SUCCESSFULLY\n");
+
+	// Set RCR, TCR and CR registers to values in rcr, tcr and cr
+	// using usb_control_msg()
+	usb_control_msg(priv->udev, usb_sndctrlpipe(priv->udev, 0), RTL8150_REQ_SET_REGS, RTL8150_REQT_WRITE, RCR, 0, &rcr, 1, 500);
+	usb_control_msg(priv->udev, usb_sndctrlpipe(priv->udev, 0), RTL8150_REQ_SET_REGS, RTL8150_REQT_WRITE, TCR, 0, &tcr, 1, 500);
+	usb_control_msg(priv->udev, usb_sndctrlpipe(priv->udev, 0), RTL8150_REQ_SET_REGS, RTL8150_REQT_WRITE, CR, 0, &cr, 1, 500);
+
+	// Read CS Configuration Register(CSCR) register value in tmp,
+	usb_control_msg(priv->udev, usb_sndctrlpipe(priv->udev, 0), RTL8150_REQ_GET_REGS, RTL8150_REQT_READ, CSCR, 0, &tmp, 2, 500);
+
+	// Check Link status
+	if(tmp & CSCR_LINK_STATUS)
+		netif_carrier_on(netdev);
+	else
+		netif_carrier_off(netdev);
+
+	printk(KERN_INFO "\n DEVICE CARRIER SET SUCCESSFULLY\n");
+}
+
 static int rtl8150_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	printk("rtl8150_start_xmit: Add code later\n");
-        dev_kfree_skb(skb); /* Just free it for now */
+	int res;
+	rtl8150_t *priv;
+	printk("rtl8150_start_xmit\n");
+	priv = netdev_priv(dev);
+	// allocate memory for buld urb
+    priv->tx_urb = usb_alloc_urb(0, GFP_KERNEL);
+	
+	// point tx_skb to the sk_buff received from the protocol engine
+	priv->tx_skb = skb;
 
-        return 0;
+	// populate bulk urb and register call back function
+	usb_fill_bulk_urb(priv->tx_urb, priv->udev, usb_sndbulkpipe(priv->udev, 2), skb->data, skb->len, write_bulk_callback, priv);
+
+	if((res = usb_submit_urb(priv->tx_urb, GFP_ATOMIC))) {
+		if(res == -ENODEV)
+			netif_device_detach(priv->netdev);
+		else {
+			priv->stats.tx_errors++;
+			netif_start_queue(dev);
+		}
+	} else {
+		priv->stats.tx_packets++;
+		priv->stats.tx_bytes += skb->len;
+	}
+	//dev_kfree_skb(skb); /* Just free it for now */
+
+    return NETDEV_TX_OK;
 	
 }
 
 static struct net_device_stats* rtl8150_get_stats(struct net_device *dev)
 {
-	struct rtl8150 *priv = netdev_priv( dev );
+	rtl8150_t *priv = netdev_priv( dev );
 
 	printk("dev_get_stats: Add code later\n");
 
@@ -285,7 +550,7 @@ static struct net_device_stats* rtl8150_get_stats(struct net_device *dev)
 static void rtl8150_disconnect(struct usb_interface *intf)
 {
 	/* Get address of device private structure */
-	struct rtl8150 *priv = usb_get_intfdata(intf);
+	rtl8150_t *priv = usb_get_intfdata(intf);
 
 	if (priv) {
 		/**
